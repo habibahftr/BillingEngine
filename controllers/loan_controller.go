@@ -126,17 +126,17 @@ func PaymentLoan(db *sql.DB) gin.HandlerFunc {
 			AmountPaid:  sql.NullFloat64{Float64: payment.AmountPaid},
 		}
 
-		//loanOnDB, err := models.GetLoanByCustomerID(models.LoanModel{
-		//	CustomerID: userParam.CustomerID,
-		//}, db)
-		//if err != nil {
-		//	return
-		//}
-		//
-		//if loanOnDB.ID.Int64 != 0 {
-		//	ctx.JSON(http.StatusBadRequest, gin.H{"error": "You still have outstanding loan"})
-		//	return
-		//}
+		loanOnDB, err := models.GetLoanByCustomerID(models.LoanModel{
+			CustomerID: userParam.CustomerID,
+		}, db)
+		if err != nil {
+			return
+		}
+
+		if loanOnDB.ID.Int64 != 0 {
+			ctx.JSON(http.StatusBadRequest, gin.H{"error": "You still have outstanding loan"})
+			return
+		}
 
 		resultDelinquent, err := models.IsDelinquentCustomer(models.LoanModel{
 			CustomerID: userParam.CustomerID,
