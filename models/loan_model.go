@@ -22,6 +22,9 @@ type LoanModel struct {
 	CustomerName   sql.NullString
 	RemainingWeeks sql.NullInt16
 	AmountDue      sql.NullFloat64
+	DueDate        sql.NullTime
+	DelinquentWeek sql.NullInt16
+	LoanScheduleID sql.NullInt64
 }
 
 func InsertLoan(tx *sql.Tx, loanModel LoanModel) (id int64, err error) {
@@ -118,17 +121,17 @@ func GetOutstandingInfo(userParam LoanModel, db *sql.DB) (result LoanModel, err 
 		` 
 			SELECT 
 				COUNT(ls.id) AS remaining_weeks, (l.total_payable - l.out_standing)as paid, l.out_standing,
-				l.customer_id, c.name
+				l.customer_id, c.name, l.id
 			FROM loans_schedule ls
 			LEFT JOIN loans l ON ls.loan_id = l.id AND ls.is_paid = FALSE
 			LEFT JOIN customer c ON c.id = l.customer_id
 			WHERE l.customer_id = $1
-			GROUP BY l.out_standing, l.total_payable, l.customer_id, c.name `
+			GROUP BY l.out_standing, l.total_payable, l.customer_id, c.name, l.id `
 
 	param := []interface{}{userParam.CustomerID.Int64}
 	err = db.QueryRow(query, param...).Scan(
 		&result.RemainingWeeks, &result.Paid, &result.Outstanding,
-		&result.CustomerID, &result.CustomerName,
+		&result.CustomerID, &result.CustomerName, &result.ID,
 	)
 	return
 }
@@ -140,16 +143,44 @@ func IsDelinquentCustomer(userParam LoanModel, db *sql.DB) (result LoanModel, er
 			CASE WHEN COUNT(ls.id) >= 2 THEN TRUE
 			ELSE FALSE
 			END, 
-		    SUM(ls.amount_due)
+		    SUM(ls.amount_due),
+		    COUNT(ls.id)
 		FROM 
 			loans_schedule ls
 			LEFT JOIN loans l ON ls.loan_id = l.id AND ls.is_paid = FALSE
 			LEFT JOIN customer c ON c.id = l.customer_id
-		WHERE ls.due_date < CURRENT_DATE  AND l.deleted = FALSE AND l.customer_id = 1 `
+		WHERE ls.due_date <= CURRENT_DATE  AND l.deleted = FALSE AND l.customer_id = $1 `
 
 	param := []interface{}{userParam.CustomerID.Int64}
 	err = db.QueryRow(query, param...).Scan(
-		&result.IsDelinquent, &result.AmountDue,
+		&result.IsDelinquent, &result.AmountDue, &result.DelinquentWeek,
 	)
+	return
+}
+
+func GetLoanByCustomerAndLoanID(userParam LoanModel, db *sql.DB) (result LoanModel, err error) {
+	query :=
+		` 
+			SELECT 
+			    l.id, l.weekly_payment, temp.due_date, 
+			    temp.id, l.out_standing
+			FROM 
+			    loans l 
+			LEFT JOIN (
+			    SELECT id, loan_id, due_date FROM loans_schedule ls 
+			    WHERE loan_id = $2 AND is_paid = FALSE ORDER BY due_date ASC LIMIT 1
+			) AS temp ON temp.loan_id = l.id
+			WHERE deleted = FALSE AND customer_id = $1 AND loan_id = $2 `
+
+	param := []interface{}{userParam.CustomerID.Int64, userParam.ID.Int64}
+	err = db.QueryRow(query, param...).Scan(
+		&result.ID, &result.WeeklyPayment, &result.DueDate,
+		&result.LoanScheduleID, &result.Outstanding,
+	)
+
+	if err != nil && err != sql.ErrNoRows {
+		return
+	}
+	err = nil
 	return
 }

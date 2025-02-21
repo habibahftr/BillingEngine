@@ -8,6 +8,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"net/http"
 	"strconv"
+	"time"
 )
 
 func CreateLoan(db *sql.DB) gin.HandlerFunc {
@@ -35,6 +36,16 @@ func CreateLoan(db *sql.DB) gin.HandlerFunc {
 		}()
 		tx, err = db.Begin()
 		if err != nil {
+			return
+		}
+
+		custOnDB, err := models.GetCustomerByID(loanModel, db)
+		if err != nil {
+			return
+		}
+
+		if custOnDB.ID.Int64 != 0 {
+			ctx.JSON(http.StatusBadRequest, gin.H{"error": "Unknown data with this customer id"})
 			return
 		}
 
@@ -97,6 +108,31 @@ func GetOutStanding(db *sql.DB) gin.HandlerFunc {
 		}
 
 		resultOnDb.IsDelinquent = resultDelinquent.IsDelinquent
+
+		if resultDelinquent.IsDelinquent.Bool {
+			var tx *sql.Tx
+			defer func() {
+				if err != nil {
+					if err = tx.Rollback(); err != nil {
+						return
+					}
+				} else {
+					if err = tx.Commit(); err != nil {
+						return
+					}
+				}
+			}()
+			tx, err = db.Begin()
+			if err != nil {
+				return
+			}
+
+			err = models.UpdateLoanStatus(tx, resultOnDb)
+			if err != nil {
+				return
+			}
+		}
+
 		outstandingResponse := loan_service.ReformatResponseOutstanding(resultOnDb)
 
 		ctx.JSON(http.StatusOK, gin.H{"outstanding_balance": outstandingResponse})
@@ -105,52 +141,11 @@ func GetOutStanding(db *sql.DB) gin.HandlerFunc {
 
 func PaymentLoan(db *sql.DB) gin.HandlerFunc {
 	return func(ctx *gin.Context) {
-		custId := ctx.Param("cust_id")
-		customerId, err := strconv.Atoi(custId)
-		if err != nil || customerId == 0 {
-			ctx.JSON(http.StatusBadRequest, gin.H{"error": "invalid format customer id"})
-			return
-		}
-
 		var payment dto_in.Payment
-		err = ctx.ShouldBindJSON(&payment)
+		err := ctx.ShouldBindJSON(&payment)
 		if err != nil {
 			ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
-		}
-
-		userParam := models.PaymentModel{
-			CustomerID:  sql.NullInt64{Int64: int64(customerId)},
-			LoanID:      sql.NullInt64{Int64: payment.LoanID},
-			PaymentDate: sql.NullTime{Time: payment.PaymentDate},
-			AmountPaid:  sql.NullFloat64{Float64: payment.AmountPaid},
-		}
-
-		loanOnDB, err := models.GetLoanByCustomerID(models.LoanModel{
-			CustomerID: userParam.CustomerID,
-		}, db)
-		if err != nil {
-			return
-		}
-
-		if loanOnDB.ID.Int64 != 0 {
-			ctx.JSON(http.StatusBadRequest, gin.H{"error": "You still have outstanding loan"})
-			return
-		}
-
-		resultDelinquent, err := models.IsDelinquentCustomer(models.LoanModel{
-			CustomerID: userParam.CustomerID,
-		}, db)
-		if err != nil {
-			ctx.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get is delinquent status "})
-			return
-		}
-
-		if resultDelinquent.IsDelinquent.Bool {
-			if userParam.AmountPaid.Float64 != resultDelinquent.AmountDue.Float64 {
-				ctx.JSON(http.StatusBadRequest, gin.H{"error": "Payment amount must match the amount due"})
-				return
-			}
 		}
 
 		var tx *sql.Tx
@@ -170,6 +165,95 @@ func PaymentLoan(db *sql.DB) gin.HandlerFunc {
 			return
 		}
 
-	}
+		var timeNow = time.Now()
+		userParam := models.PaymentModel{
+			CustomerID:  sql.NullInt64{Int64: payment.CustomerID},
+			LoanID:      sql.NullInt64{Int64: payment.LoanID},
+			AmountPaid:  sql.NullFloat64{Float64: payment.AmountPaid},
+			CreatedAt:   sql.NullTime{Time: timeNow},
+			PaymentDate: sql.NullTime{Time: timeNow},
+		}
 
+		loanOnDB, err := models.GetLoanByCustomerAndLoanID(models.LoanModel{
+			CustomerID: userParam.CustomerID,
+			ID:         userParam.LoanID,
+		}, db)
+		if err != nil {
+			return
+		}
+
+		if loanOnDB.ID.Int64 == 0 {
+			ctx.JSON(http.StatusBadRequest, gin.H{"error": "Unknown data with this customer id or loan id"})
+			return
+		}
+
+		resultDelinquent, err := models.IsDelinquentCustomer(models.LoanModel{
+			CustomerID: userParam.CustomerID,
+		}, db)
+		if err != nil {
+			ctx.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get is delinquent status "})
+			return
+		}
+
+		var outstanding float64
+		if resultDelinquent.IsDelinquent.Bool {
+			if userParam.AmountPaid.Float64 != resultDelinquent.AmountDue.Float64 {
+				ctx.JSON(http.StatusBadRequest, gin.H{"error": "Payment amount must match the amount due"})
+				return
+			}
+
+			var listID []int64
+			listID, err = models.GetDelinquentID(db, userParam)
+			if err != nil {
+				ctx.JSON(http.StatusInternalServerError, gin.H{"error": "Failed get loans schedule delinquent"})
+				return
+			}
+
+			for i := 0; i < len(listID); i++ {
+				err = models.UpdateLoanScheduleStatus(tx, models.PaymentModel{
+					ID: sql.NullInt64{Int64: listID[i]},
+				})
+				if err != nil {
+					ctx.JSON(http.StatusInternalServerError, gin.H{"error": "Failed update loan schedule status "})
+					return
+				}
+			}
+
+		} else {
+			today := time.Now().Truncate(24 * time.Hour)
+			if !today.Equal(loanOnDB.DueDate.Time) {
+				ctx.JSON(http.StatusBadRequest, gin.H{"error": "You do not have bill to pay"})
+				return
+			}
+
+			err = models.UpdateLoanScheduleStatus(tx, models.PaymentModel{
+				ID: sql.NullInt64{Int64: loanOnDB.LoanScheduleID.Int64},
+			})
+			if err != nil {
+				ctx.JSON(http.StatusInternalServerError, gin.H{"error": "Failed update loan schedule status "})
+				return
+			}
+		}
+
+		_, err = models.InsertPayment(tx, userParam)
+		if err != nil {
+			ctx.JSON(http.StatusInternalServerError, gin.H{"error": "Failed insert into payment "})
+			return
+		}
+
+		if loanOnDB.Outstanding.Float64 != 0 {
+			outstanding = loanOnDB.Outstanding.Float64 - userParam.AmountPaid.Float64
+		}
+		err = models.UpdateLoanStatus(tx, models.LoanModel{
+			Outstanding:  sql.NullFloat64{Float64: outstanding},
+			IsDelinquent: sql.NullBool{Bool: false},
+			ID:           sql.NullInt64{Int64: userParam.LoanID.Int64},
+		})
+		if err != nil {
+			ctx.JSON(http.StatusInternalServerError, gin.H{"error": "Failed update loan outstanding"})
+			return
+		}
+
+		ctx.JSON(http.StatusOK, gin.H{"message": "Payment successfully"})
+	}
 }
