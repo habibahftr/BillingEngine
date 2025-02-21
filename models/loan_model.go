@@ -113,6 +113,11 @@ func GetLoanByCustomerID(userParam LoanModel, db *sql.DB) (result LoanModel, err
 	err = db.QueryRow(query, param...).Scan(
 		&result.ID,
 	)
+
+	if err != nil && err != sql.ErrNoRows {
+		return
+	}
+	err = nil
 	return
 }
 

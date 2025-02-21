@@ -44,7 +44,7 @@ func CreateLoan(db *sql.DB) gin.HandlerFunc {
 			return
 		}
 
-		if custOnDB.ID.Int64 != 0 {
+		if custOnDB.ID.Int64 == 0 {
 			ctx.JSON(http.StatusBadRequest, gin.H{"error": "Unknown data with this customer id"})
 			return
 		}
